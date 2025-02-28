@@ -14,13 +14,14 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-//go:build !js
-// +build !js
+//go:build !js && !wasip1
+// +build !js,!wasip1
 
 // Package leveldb implements the key-value database layer based on LevelDB.
 package leveldb
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 	"time"
@@ -61,21 +62,21 @@ type Database struct {
 	fn string      // filename for reporting
 	db *leveldb.DB // LevelDB instance
 
-	compTimeMeter       metrics.Meter // Meter for measuring the total time spent in database compaction
-	compReadMeter       metrics.Meter // Meter for measuring the data read during compaction
-	compWriteMeter      metrics.Meter // Meter for measuring the data written during compaction
-	writeDelayNMeter    metrics.Meter // Meter for measuring the write delay number due to database compaction
-	writeDelayMeter     metrics.Meter // Meter for measuring the write delay duration due to database compaction
-	diskSizeGauge       metrics.Gauge // Gauge for tracking the size of all the levels in the database
-	diskReadMeter       metrics.Meter // Meter for measuring the effective amount of data read
-	diskWriteMeter      metrics.Meter // Meter for measuring the effective amount of data written
-	memCompGauge        metrics.Gauge // Gauge for tracking the number of memory compaction
-	level0CompGauge     metrics.Gauge // Gauge for tracking the number of table compaction in level0
-	nonlevel0CompGauge  metrics.Gauge // Gauge for tracking the number of table compaction in non0 level
-	seekCompGauge       metrics.Gauge // Gauge for tracking the number of table compaction caused by read opt
-	manualMemAllocGauge metrics.Gauge // Gauge to track the amount of memory that has been manually allocated (not a part of runtime/GC)
+	compTimeMeter       *metrics.Meter // Meter for measuring the total time spent in database compaction
+	compReadMeter       *metrics.Meter // Meter for measuring the data read during compaction
+	compWriteMeter      *metrics.Meter // Meter for measuring the data written during compaction
+	writeDelayNMeter    *metrics.Meter // Meter for measuring the write delay number due to database compaction
+	writeDelayMeter     *metrics.Meter // Meter for measuring the write delay duration due to database compaction
+	diskSizeGauge       *metrics.Gauge // Gauge for tracking the size of all the levels in the database
+	diskReadMeter       *metrics.Meter // Meter for measuring the effective amount of data read
+	diskWriteMeter      *metrics.Meter // Meter for measuring the effective amount of data written
+	memCompGauge        *metrics.Gauge // Gauge for tracking the number of memory compaction
+	level0CompGauge     *metrics.Gauge // Gauge for tracking the number of table compaction in level0
+	nonlevel0CompGauge  *metrics.Gauge // Gauge for tracking the number of table compaction in non0 level
+	seekCompGauge       *metrics.Gauge // Gauge for tracking the number of table compaction caused by read opt
+	manualMemAllocGauge *metrics.Gauge // Gauge to track the amount of memory that has been manually allocated (not a part of runtime/GC)
 
-	levelsGauge []metrics.Gauge // Gauge for tracking the number of tables in levels
+	levelsGauge []*metrics.Gauge // Gauge for tracking the number of tables in levels
 
 	quitLock sync.Mutex      // Mutex protecting the quit channel access
 	quitChan chan chan error // Quit channel to stop the metrics collection before closing the database
@@ -206,6 +207,36 @@ func (db *Database) Delete(key []byte) error {
 	return db.db.Delete(key, nil)
 }
 
+var ErrTooManyKeys = errors.New("too many keys in deleted range")
+
+// DeleteRange deletes all of the keys (and values) in the range [start,end)
+// (inclusive on start, exclusive on end).
+// Note that this is a fallback implementation as leveldb does not natively
+// support range deletion. It can be slow and therefore the number of deleted
+// keys is limited in order to avoid blocking for a very long time.
+// ErrTooManyKeys is returned if the range has only been partially deleted.
+// In this case the caller can repeat the call until it finally succeeds.
+func (db *Database) DeleteRange(start, end []byte) error {
+	batch := db.NewBatch()
+	it := db.NewIterator(nil, start)
+	defer it.Release()
+
+	var count int
+	for it.Next() && bytes.Compare(end, it.Key()) > 0 {
+		count++
+		if count > 10000 { // should not block for more than a second
+			if err := batch.Write(); err != nil {
+				return err
+			}
+			return ErrTooManyKeys
+		}
+		if err := batch.Delete(it.Key()); err != nil {
+			return err
+		}
+	}
+	return batch.Write()
+}
+
 // NewBatch creates a write-only key-value store that buffers changes to its host
 // database until a final write is called.
 func (db *Database) NewBatch() ethdb.Batch {
@@ -228,19 +259,6 @@ func (db *Database) NewBatchWithSize(size int) ethdb.Batch {
 // initial key (or after, if it does not exist).
 func (db *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	return db.db.NewIterator(bytesPrefixRange(prefix, start), nil)
-}
-
-// NewSnapshot creates a database snapshot based on the current state.
-// The created snapshot will not be affected by all following mutations
-// happened on the database.
-// Note don't forget to release the snapshot once it's used up, otherwise
-// the stale data will never be cleaned up by the underlying compactor.
-func (db *Database) NewSnapshot() (ethdb.Snapshot, error) {
-	snap, err := db.db.GetSnapshot()
-	if err != nil {
-		return nil, err
-	}
-	return &snapshot{db: snap}, nil
 }
 
 // Stat returns the statistic data of the database.
@@ -497,27 +515,4 @@ func bytesPrefixRange(prefix, start []byte) *util.Range {
 	r := util.BytesPrefix(prefix)
 	r.Start = append(r.Start, start...)
 	return r
-}
-
-// snapshot wraps a leveldb snapshot for implementing the Snapshot interface.
-type snapshot struct {
-	db *leveldb.Snapshot
-}
-
-// Has retrieves if a key is present in the snapshot backing by a key-value
-// data store.
-func (snap *snapshot) Has(key []byte) (bool, error) {
-	return snap.db.Has(key, nil)
-}
-
-// Get retrieves the given key if it's present in the snapshot backing by
-// key-value data store.
-func (snap *snapshot) Get(key []byte) ([]byte, error) {
-	return snap.db.Get(key, nil)
-}
-
-// Release releases associated resources. Release should always succeed and can
-// be called multiple times without causing error.
-func (snap *snapshot) Release() {
-	snap.db.Release()
 }
